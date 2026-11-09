@@ -1,0 +1,568 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="author" content="Ivan Dimitrov">
+<title>Wetter Frankfurt Westend</title>
+
+<style>
+:root{
+    --bg:#0b1220;
+    --card:#141d2f;
+    --text:#f4f7fb;
+    --muted:#9aa8bf;
+}
+*{box-sizing:border-box;}
+body{
+    margin:0;
+    background:linear-gradient(180deg,#08101d,#111827);
+    color:var(--text);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+}
+.container{max-width:1400px;margin:auto;padding:30px;}
+h1{margin:0;}
+.subtitle{color:var(--muted);margin-top:8px;margin-bottom:24px;}
+.metrics{
+    display:grid;
+    grid-template-columns:repeat(auto-fit,minmax(180px,1fr));
+    gap:14px;
+    margin-bottom:24px;
+}
+.metric{background:var(--card);border-radius:14px;padding:18px;}
+.metric-label{color:var(--muted);font-size:13px;}
+.metric-value{font-size:28px;font-weight:700;margin-top:8px;}
+.metric-dwd{font-size:17px;font-weight:600;color:#fbbf24;margin-top:4px;}
+.metric-bs{font-size:17px;font-weight:600;color:#f472b6;margin-top:4px;}
+.metric-obs{font-size:17px;font-weight:600;color:#ffffff;margin-top:4px;}
+.card{
+    background:var(--card);
+    border-radius:18px;
+    padding:20px;
+    margin-bottom:22px;
+    box-shadow:0 12px 35px rgba(0,0,0,.25);
+}
+.chart-title{margin-bottom:10px;font-size:18px;font-weight:600;}
+canvas{width:100%;height:340px;display:block;}
+.footer{color:var(--muted);font-size:13px;margin-top:20px;}
+.loading{text-align:center;padding:50px;}
+</style>
+</head>
+<body>
+
+<div class="container">
+
+<h1>Frankfurt Westend Wetter</h1>
+
+<div class="subtitle">
+Vergangenheit (3 Tage) + Prognose (3 Tage) &bull; Durchgezogen: Open-Meteo DWD &bull; Gestrichelt (gelb): DWD ICON-D2 &bull; Gepunktet (pink): Bright Sky DWD &bull; ECMWF IFS (grün) &bull; NOAA GFS (rot) &bull; Météo-France AROME (lila) &bull; Weiß: Messung Westend (DWD 01424)
+</div>
+
+<div class="metrics" id="metrics"></div>
+
+<div class="card"><div class="chart-title">Temperatur (°C)</div><canvas id="temp"></canvas></div>
+<div class="card"><div class="chart-title">Niederschlag (mm)</div><canvas id="rain"></canvas></div>
+<div class="card"><div class="chart-title">Regenwahrscheinlichkeit (%)</div><canvas id="prob"></canvas></div>
+<div class="card"><div class="chart-title">Windgeschwindigkeit (km/h)</div><canvas id="wind"></canvas></div>
+<div class="card"><div class="chart-title">Luftfeuchtigkeit (%)</div><canvas id="humidity"></canvas></div>
+<div class="card"><div class="chart-title">Bewölkung (%)</div><canvas id="cloud"></canvas></div>
+<div class="card"><div class="chart-title">Luftdruck (hPa)</div><canvas id="pressure"></canvas></div>
+
+<div class="footer">
+Links = Vergangenheit &bull; Rot = JETZT &bull; Rechts = Prognose<br>
+<span id="dwdStatus"></span><br>
+<span id="bsStatus"></span><br>
+<span id="modelStatus"></span><br>
+<span id="obsStatus"></span>
+</div>
+
+</div>
+
+<script>
+
+const LAT = 50.118;
+const LON = 8.667;
+const DWD_COLOR = "#fbbf24";
+const BS_COLOR = "#f472b6";
+const OBS_COLOR = "#ffffff";
+const OBS_STATION = "01424";
+
+/* Zusaetzliche Wettermodelle (Open-Meteo, CORS-faehig) */
+const MODELS = [
+    {label:"ECMWF IFS",          url:"https://api.open-meteo.com/v1/ecmwf",       color:"#34d399", dash:[10,3,2,3]},
+    {label:"NOAA GFS",           url:"https://api.open-meteo.com/v1/gfs",         color:"#f87171", dash:[12,4]},
+    {label:"Météo-France AROME", url:"https://api.open-meteo.com/v1/meteofrance", color:"#c084fc", dash:[3,3]}
+];
+
+/* Optional: eigener CORS-Proxy fuer den echten WarnWetter-Endpunkt, z.B.
+   "https://mein-worker.example.workers.dev/?url=" 
+   Leer lassen = nur DWD ICON ueber Open-Meteo (funktioniert direkt im Browser). */
+const WARNWETTER_PROXY = "";
+const DWD_STATION = "10865";
+
+const HOURLY =
+    "temperature_2m,precipitation,precipitation_probability," +
+    "wind_speed_10m,relative_humidity_2m,cloud_cover,pressure_msl";
+
+function deDate(d){
+    return d.toLocaleDateString("de-DE",{weekday:"short",day:"2-digit",month:"2-digit"});
+}
+function deHour(d){
+    return d.toLocaleTimeString("de-DE",{hour:"2-digit",minute:"2-digit"});
+}
+function valid(v){ return v!==null && v!==undefined && !isNaN(v); }
+function fmt(v,dec,unit){
+    return valid(v) ? Number(v).toFixed(dec)+unit : "n/a";
+}
+function metric(label,value,dwdValue,bsValue,obsValue){
+    return `
+        <div class="metric">
+            <div class="metric-label">${label}</div>
+            <div class="metric-value">${value}</div>
+            ${dwdValue!==undefined ? `<div class="metric-dwd">DWD ICON-D2: ${dwdValue}</div>` : ""}
+            ${bsValue!==undefined ? `<div class="metric-bs">Bright Sky DWD: ${bsValue}</div>` : ""}
+            ${obsValue!==undefined ? `<div class="metric-obs">Messung: ${obsValue}</div>` : ""}
+        </div>`;
+}
+
+/* ---------- DWD Quelle 1: Open-Meteo DWD ICON (CORS-faehig) ---------- */
+async function loadDwdIcon(){
+    const url =
+        `https://api.open-meteo.com/v1/dwd-icon?latitude=${LAT}&longitude=${LON}` +
+        `&hourly=${HOURLY}&past_days=3&forecast_days=3&timezone=Europe/Berlin`;
+    const r = await fetch(url);
+    if(!r.ok) throw new Error("DWD ICON HTTP "+r.status);
+    const j = await r.json();
+    if(!j.hourly) throw new Error("DWD ICON ohne Daten");
+    return { times:j.hourly.time, hourly:j.hourly, label:"DWD ICON-D2 (via Open-Meteo)" };
+}
+
+/* ---------- Weitere Modelle: ECMWF, GFS, AROME (Open-Meteo) ---------- */
+async function loadModel(m){
+    const base =
+        `${m.url}?latitude=${LAT}&longitude=${LON}` +
+        `&past_days=3&forecast_days=3&timezone=Europe/Berlin` +
+        `&elevation=nan&cell_selection=nearest&hourly=`;
+    let r = await fetch(base + HOURLY);
+    if(!r.ok){
+        // Fallback: ohne Regenwahrscheinlichkeit
+        r = await fetch(base + HOURLY.replace("precipitation_probability,",""));
+    }
+    if(!r.ok) throw new Error("HTTP "+r.status);
+    const j = await r.json();
+    if(!j.hourly) throw new Error("ohne Daten");
+    return { times:j.hourly.time, hourly:j.hourly, label:m.label, color:m.color, dash:m.dash };
+}
+
+/* ---------- DWD Quelle 2: WarnWetter ueber eigenen Proxy (optional) ---------- */
+function dwdScaled(v,scale){
+    if(!valid(v) || v===32767 || v===-99 || v===-999) return null;
+    return v/scale;
+}
+async function loadWarnWetterViaProxy(){
+    const target = `https://app-prod-ws.warnwetter.de/v30/stationOverviewExtended?stationIds=${DWD_STATION}`;
+    const r = await fetch(WARNWETTER_PROXY + encodeURIComponent(target));
+    if(!r.ok) throw new Error("Proxy HTTP "+r.status);
+    const raw = await r.json();
+    const st = raw[DWD_STATION] || Object.values(raw)[0];
+    const f = st && st.forecast1;
+    if(!f || !Array.isArray(f.temperature) || f.start===undefined)
+        throw new Error("forecast1 fehlt");
+    const pts = f.temperature.map((_,i)=>({
+        t:    f.start + i*3600000,
+        temperature_2m:            dwdScaled(f.temperature[i],10),
+        precipitation:             dwdScaled(f.precipitationTotal?.[i],10),
+        precipitation_probability: dwdScaled(f.precipitationProbability?.[i],1),
+        wind_speed_10m:            dwdScaled(f.windSpeed?.[i],1),
+        cloud_cover:               dwdScaled(f.cloudCover?.[i],1)
+    }));
+    return { points:pts, label:"DWD WarnWetter (Station "+DWD_STATION+", via Proxy)" };
+}
+
+/* ---------- DWD Quelle 3: Bright Sky (CORS-faehig, Beobachtung + Prognose) ---------- */
+async function loadBrightSky(){
+    const d0 = new Date(Date.now() - 3*86400000).toISOString().split("T")[0];
+    const d1 = new Date(Date.now() + 4*86400000).toISOString().split("T")[0];
+    const url =
+        `https://api.brightsky.dev/weather?lat=${LAT}&lon=${LON}` +
+        `&date=${d0}&last_date=${d1}&tz=Europe/Berlin`;
+    const r = await fetch(url);
+    if(!r.ok) throw new Error("Bright Sky HTTP "+r.status);
+    const j = await r.json();
+    if(!j.weather || !j.weather.length) throw new Error("Bright Sky ohne Daten");
+    const pts = j.weather.map(w=>({
+        t: new Date(w.timestamp).getTime(),
+        temperature_2m:            w.temperature,
+        precipitation:             w.precipitation,
+        precipitation_probability: w.precipitation_probability,
+        wind_speed_10m:            w.wind_speed,
+        relative_humidity_2m:      w.relative_humidity,
+        cloud_cover:               w.cloud_cover,
+        pressure_msl:              w.pressure_msl
+    }));
+    const src = (j.sources && j.sources[0] && j.sources[0].station_name)
+        ? " (Station "+j.sources[0].station_name+")" : "";
+    return { points:pts, label:"Bright Sky DWD"+src };
+}
+
+/* ---------- Messung: DWD Station 01424 Frankfurt-Westend (via Bright Sky) ---------- */
+async function loadObservations(){
+    const d0 = new Date(Date.now() - 3*86400000).toISOString().split("T")[0];
+    const d1 = new Date(Date.now() + 86400000).toISOString().split("T")[0];
+    const url =
+        `https://api.brightsky.dev/weather?dwd_station_id=${OBS_STATION}` +
+        `&date=${d0}&last_date=${d1}&tz=Europe/Berlin`;
+    const r = await fetch(url);
+    if(!r.ok) throw new Error("Messung HTTP "+r.status);
+    const j = await r.json();
+    if(!j.weather || !j.weather.length) throw new Error("Messung ohne Daten");
+    // nur Vergangenheit = gemessene Werte
+    const pts = j.weather
+        .filter(w=>new Date(w.timestamp).getTime() <= Date.now())
+        .map(w=>({
+            t: new Date(w.timestamp).getTime(),
+            temperature_2m:            w.temperature,
+            precipitation:             w.precipitation,
+            wind_speed_10m:            w.wind_speed,
+            relative_humidity_2m:      w.relative_humidity,
+            cloud_cover:               w.cloud_cover,
+            pressure_msl:              w.pressure_msl
+        }));
+    const names = (j.sources||[]).map(s=>s.station_name).filter(Boolean);
+    const src = names.length ? " (Stationen: "+[...new Set(names)].join(", ")+")" : "";
+    return { points:pts, label:"Messung Westend DWD "+OBS_STATION+src };
+}
+
+/* Punkte auf die Open-Meteo-Zeitachse legen */
+function alignPoints(times, pts, key){
+    const res = times.map(s=>{
+        const t = new Date(s).getTime();
+        let best=null, bd=90*60000;
+        for(const p of pts){
+            const d=Math.abs(p.t-t);
+            if(d<bd && valid(p[key])){bd=d;best=p[key];}
+        }
+        return best;
+    });
+    return res.some(valid) ? res : null;
+}
+
+/* ---------- Main ---------- */
+async function loadData(){
+
+    const url =
+        `https://api.open-meteo.com/v1/forecast?latitude=${LAT}&longitude=${LON}` +
+        `&hourly=${HOURLY}` +
+        `&current=temperature_2m,wind_speed_10m` +
+        `&past_days=3&forecast_days=3&timezone=Europe/Berlin`;
+
+    const omPromise = fetch(url).then(r=>{
+        if(!r.ok) throw new Error("Open-Meteo HTTP "+r.status);
+        return r.json();
+    });
+
+    // DWD: erst optionaler Proxy, dann ICON-Fallback
+    const dwdPromise = (async()=>{
+        const notes=[];
+        if(WARNWETTER_PROXY){
+            try{ return {res:await loadWarnWetterViaProxy(), type:"points", notes}; }
+            catch(e){ notes.push("WarnWetter-Proxy fehlgeschlagen: "+e.message); }
+        }
+        try{ return {res:await loadDwdIcon(), type:"hourly", notes}; }
+        catch(e){ notes.push("DWD ICON fehlgeschlagen: "+e.message); }
+        return {res:null, type:null, notes};
+    })();
+
+    // Bright Sky
+    const bsPromise = loadBrightSky()
+        .then(res=>({res, error:null}))
+        .catch(e=>({res:null, error:e.message}));
+
+    // Messung Station 01424
+    const obsPromise = loadObservations()
+        .then(res=>({res, error:null}))
+        .catch(e=>({res:null, error:e.message}));
+
+    // Weitere Modelle
+    const modelPromises = MODELS.map(m=>
+        loadModel(m)
+            .then(res=>({res, error:null, m}))
+            .catch(e=>({res:null, error:e.message, m}))
+    );
+
+    const [data, dwd, bs, obs, ...models] = await Promise.all([omPromise, dwdPromise, bsPromise, obsPromise, ...modelPromises]);
+
+    const t = data.hourly.time;
+    const status = document.getElementById("dwdStatus");
+    status.textContent = dwd.res
+        ? "Zweite Linie: " + dwd.res.label + (dwd.notes.length?" ("+dwd.notes.join("; ")+")":"")
+        : "DWD-Daten nicht verfügbar: " + dwd.notes.join("; ");
+
+    const bsStatus = document.getElementById("bsStatus");
+    bsStatus.textContent = bs.res
+        ? "Dritte Linie: " + bs.res.label + " – " + bs.res.points.length + " Datenpunkte"
+        : "Bright Sky DWD nicht verfügbar: " + bs.error;
+
+    document.getElementById("modelStatus").textContent =
+        "Weitere Modelle: " + models.map(x=>
+            x.res ? x.m.label+" OK" : x.m.label+" Fehler ("+x.error+")"
+        ).join(" | ");
+
+    document.getElementById("obsStatus").textContent = obs.res
+        ? "Messung: " + obs.res.label + " – " + obs.res.points.length + " Datenpunkte"
+        : "Messung nicht verfügbar: " + obs.error;
+
+    // DWD-Serien pro Key auf Zeitachse t bringen
+    function dwdSeries(key){
+        if(!dwd.res) return null;
+        if(dwd.type==="hourly"){
+            const d = dwd.res.hourly[key];
+            if(!d) return null;
+            // gleiche Zeitachse? sonst ausrichten
+            if(dwd.res.times.length===t.length && dwd.res.times[0]===t[0]) {
+                return d.some(valid) ? d : null;
+            }
+            const pts = dwd.res.times.map((s,i)=>({t:new Date(s).getTime(),[key]:d[i]}));
+            return alignPoints(t,pts,key);
+        }
+        return alignPoints(t,dwd.res.points,key);
+    }
+
+    // Bright Sky-Serien auf Zeitachse t bringen
+    function bsSeries(key){
+        if(!bs.res) return null;
+        return alignPoints(t,bs.res.points,key);
+    }
+
+    // Mess-Serien auf Zeitachse t bringen
+    function obsSeries(key){
+        if(!obs.res) return null;
+        return alignPoints(t,obs.res.points,key);
+    }
+
+    // Modell-Serien auf Zeitachse t bringen
+    function modelSeries(mr,key){
+        const d = mr.res.hourly[key];
+        if(!d) return null;
+        if(mr.res.times.length===t.length && mr.res.times[0]===t[0]){
+            return d.some(valid) ? d : null;
+        }
+        const pts = mr.res.times.map((s,i)=>({t:new Date(s).getTime(),[key]:d[i]}));
+        return alignPoints(t,pts,key);
+    }
+
+    let nowIdx=0, best=Infinity;
+    t.forEach((v,i)=>{
+        const d=Math.abs(new Date(v).getTime()-Date.now());
+        if(d<best){best=d;nowIdx=i;}
+    });
+
+    const dNow = key => { const s=dwdSeries(key); return s?s[nowIdx]:null; };
+    const bNow = key => { const s=bsSeries(key); return s?s[nowIdx]:null; };
+    const oNow = key => {
+        const s=obsSeries(key);
+        if(!s) return null;
+        for(let i=nowIdx;i>=0;i--){ if(valid(s[i])) return s[i]; }
+        return null;
+    };
+    const hasDwd = !!dwd.res;
+    const hasBs = !!bs.res;
+    const hasObs = !!obs.res;
+
+    const temps = data.hourly.temperature_2m.filter(valid);
+
+    document.getElementById("metrics").innerHTML =
+        metric("Temperatur Jetzt", fmt(data.current.temperature_2m,1,"°C"),
+               hasDwd ? fmt(dNow("temperature_2m"),1,"°C") : undefined,
+               hasBs ? fmt(bNow("temperature_2m"),1,"°C") : undefined,
+               hasObs ? fmt(oNow("temperature_2m"),1,"°C") : undefined) +
+        metric("Wind Jetzt", fmt(data.current.wind_speed_10m,1," km/h"),
+               hasDwd ? fmt(dNow("wind_speed_10m"),1," km/h") : undefined,
+               hasBs ? fmt(bNow("wind_speed_10m"),1," km/h") : undefined,
+               hasObs ? fmt(oNow("wind_speed_10m"),1," km/h") : undefined) +
+        metric("Regenwahrscheinlichkeit Jetzt",
+               fmt(data.hourly.precipitation_probability[nowIdx],0," %"),
+               hasDwd ? fmt(dNow("precipitation_probability"),0," %") : undefined,
+               hasBs ? fmt(bNow("precipitation_probability"),0," %") : undefined) +
+        metric("Maximum", Math.max(...temps).toFixed(1)+"°C") +
+        metric("Minimum", Math.min(...temps).toFixed(1)+"°C");
+
+    const defs = [
+        ["temp",     "temperature_2m",            "#4f8cff","°C"],
+        ["rain",     "precipitation",             "#4ade80","mm"],
+        ["prob",     "precipitation_probability", "#22d3ee","%"],
+        ["wind",     "wind_speed_10m",            "#38bdf8","km/h"],
+        ["humidity", "relative_humidity_2m",      "#2dd4bf","%"],
+        ["cloud",    "cloud_cover",               "#a78bfa","%"],
+        ["pressure", "pressure_msl",              "#f59e0b","hPa"]
+    ];
+
+    const render = ()=>{
+        defs.forEach(([id,key,color,unit])=>{
+            const extras = models.filter(x=>x.res).map(x=>({
+                series: modelSeries(x,key),
+                color:  x.res.color,
+                dash:   x.res.dash,
+                label:  x.res.label
+            }));
+            drawChart(document.getElementById(id), t, data.hourly[key],
+                      dwdSeries(key), color, unit, bsSeries(key), extras, obsSeries(key));
+        });
+    };
+    render();
+    window._render = render;
+}
+
+function drawChart(canvas,times,series,series2,color,unit,series3,extras,series4){
+
+    extras = (extras||[]).filter(e=>e.series);
+
+    const ctx = canvas.getContext("2d");
+    const dpr = window.devicePixelRatio || 1;
+
+    const width = canvas.parentElement.clientWidth - 40;
+    const height = 340;
+
+    canvas.width = width*dpr;
+    canvas.height = height*dpr;
+    ctx.scale(dpr,dpr);
+
+    const w=width, h=height, pad=55;
+
+    const all = series.concat(series2||[], series3||[], series4||[], ...extras.map(e=>e.series)).filter(valid);
+    const min = all.length ? Math.min(...all) : 0;
+    const max = all.length ? Math.max(...all) : 1;
+
+    let nowIndex=0, diffBest=Number.MAX_VALUE;
+    times.forEach((v,i)=>{
+        const diff=Math.abs(new Date(v).getTime()-Date.now());
+        if(diff<diffBest){diffBest=diff;nowIndex=i;}
+    });
+
+    const x = i => pad + i*(w-pad*2)/(times.length-1);
+    const y = v => max===min ? h/2 : h-pad-(v-min)/(max-min)*(h-pad*2);
+    const xNow = x(nowIndex);
+
+    ctx.fillStyle="rgba(74,222,128,0.08)";
+    ctx.fillRect(pad,pad,xNow-pad,h-pad*2);
+    ctx.fillStyle="rgba(79,140,255,0.08)";
+    ctx.fillRect(xNow,pad,w-pad-xNow,h-pad*2);
+
+    ctx.lineWidth=1;
+    ctx.strokeStyle="rgba(255,255,255,.08)";
+    for(let i=0;i<5;i++){
+        const yy=pad+i*(h-pad*2)/4;
+        ctx.beginPath();ctx.moveTo(pad,yy);ctx.lineTo(w-pad,yy);ctx.stroke();
+    }
+
+    function line(arr,col,dash){
+        ctx.strokeStyle=col;
+        ctx.lineWidth=3;
+        ctx.setLineDash(dash||[]);
+        ctx.beginPath();
+        let started=false;
+        arr.forEach((v,i)=>{
+            if(!valid(v)){started=false;return;}
+            if(!started){ctx.moveTo(x(i),y(v));started=true;}
+            else ctx.lineTo(x(i),y(v));
+        });
+        ctx.stroke();
+        ctx.setLineDash([]);
+    }
+
+    line(series,color);
+    if(series2) line(series2,DWD_COLOR,[7,5]);
+    if(series3) line(series3,BS_COLOR,[2,4]);
+    extras.forEach(e=>line(e.series,e.color,e.dash));
+    if(series4) line(series4,OBS_COLOR);
+
+    ctx.strokeStyle="#ff4d4d";
+    ctx.lineWidth=3;
+    ctx.beginPath();ctx.moveTo(xNow,pad);ctx.lineTo(xNow,h-pad);ctx.stroke();
+
+    ctx.fillStyle="#ff4d4d";
+    ctx.font="bold 13px sans-serif";
+    ctx.fillText("JETZT",xNow+6,pad+18);
+
+    ctx.fillStyle="#cfd8e7";
+    ctx.font="12px sans-serif";
+    for(let i=0;i<times.length;i+=24)
+        ctx.fillText(deDate(new Date(times[i])),x(i)-25,h-pad+22);
+
+    ctx.fillStyle="rgba(255,255,255,.6)";
+    for(let i=0;i<times.length;i+=6)
+        ctx.fillText(deHour(new Date(times[i])),x(i)-18,h-pad+38);
+
+    ctx.fillStyle="#ffffff";
+    ctx.fillText(max.toFixed(1)+" "+unit,6,pad+5);
+    ctx.fillText(min.toFixed(1)+" "+unit,6,h-pad);
+
+    // Legende
+    let lx=w-560;
+    ctx.fillStyle=color;
+    ctx.fillRect(lx,18,22,4);
+    ctx.fillStyle="white";
+    ctx.fillText("Open-Meteo DWD",lx+28,24);
+
+    if(series2){
+        lx+=150;
+        ctx.strokeStyle=DWD_COLOR;
+        ctx.lineWidth=3;
+        ctx.setLineDash([5,3]);
+        ctx.beginPath();ctx.moveTo(lx,20);ctx.lineTo(lx+22,20);ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.fillStyle="white";
+        ctx.fillText("DWD ICON-D2",lx+28,24);
+    }
+
+    if(series3){
+        lx+=130;
+        ctx.strokeStyle=BS_COLOR;
+        ctx.lineWidth=3;
+        ctx.setLineDash([2,4]);
+        ctx.beginPath();ctx.moveTo(lx,20);ctx.lineTo(lx+22,20);ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.fillStyle="white";
+        ctx.fillText("Bright Sky DWD",lx+28,24);
+    }
+
+    // Legende Zeile 2: weitere Modelle
+    let ex=w-560;
+    extras.forEach(e=>{
+        ctx.strokeStyle=e.color;
+        ctx.lineWidth=3;
+        ctx.setLineDash(e.dash);
+        ctx.beginPath();ctx.moveTo(ex,40);ctx.lineTo(ex+22,40);ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.fillStyle="white";
+        ctx.fillText(e.label,ex+28,44);
+        ex+=ctx.measureText(e.label).width+55;
+    });
+
+    // Legende Zeile 3: Messung
+    if(series4){
+        ctx.strokeStyle=OBS_COLOR;
+        ctx.lineWidth=3;
+        ctx.beginPath();ctx.moveTo(w-560,58);ctx.lineTo(w-538,58);ctx.stroke();
+        ctx.fillStyle="white";
+        ctx.fillText("Messung Westend (DWD "+OBS_STATION+")",w-532,62);
+    }
+}
+
+loadData().catch(err=>{
+    document.body.innerHTML = `
+        <div class="loading">
+            Fehler beim Laden der Wetterdaten.<br><br>
+            ${err}
+        </div>`;
+});
+
+window.addEventListener("resize",()=>{
+    clearTimeout(window._rt);
+    window._rt=setTimeout(()=>{ if(window._render) window._render(); },200);
+});
+
+</script>
+
+</body>
+</html>
